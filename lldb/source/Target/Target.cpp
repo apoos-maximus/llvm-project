@@ -3118,6 +3118,46 @@ llvm::Expected<TraceSP> Target::GetTraceOrCreate() {
   return CreateTrace();
 }
 
+const char *fetchPtracePolicyIfApplicable(lldb::PlatformSP platform_sp) {
+  FileSpec filespec =
+      FileSpec(llvm::StringRef("/proc/sys/kernel/yama/ptrace_scope"));
+  char ptrace_scope = '\0';
+  char *status_message = NULL;
+
+  // check if /proc/sys/kernel/yama/ptrace_scope file exists
+  if (platform_sp->GetFileExists(filespec)) {
+    Status fileOperationStatus = Status();
+    mode_t perms = lldb::eFilePermissionsUserRW |
+                   lldb::eFilePermissionsGroupRead |
+                   lldb::eFilePermissionsWorldRead;
+    lldb::user_id_t fd = platform_sp->OpenFile(
+        filespec, File::eOpenOptionReadOnly, perms, fileOperationStatus);
+
+    platform_sp->ReadFile(fd, 0, &ptrace_scope, sizeof(char),
+                          fileOperationStatus);
+    platform_sp->CloseFile(fd, fileOperationStatus);
+
+    // return ptrace policy message only if ptrace_scope value is not zero
+    // i.e. ptrace_scope is the reason behind attach fail
+    if (ptrace_scope != '0') {
+      status_message =
+          "Could not attach to process. If your uid matches the uid of the "
+          "target process, \n"
+          "check the setting of /proc/sys/kernel/yama/ptrace_scope, \n"
+          "or try again as the root user. ";
+    } else {
+      status_message = "Try again as the root user";
+    }
+  }
+
+  // simply return try as Root user if file doesn't exist
+  else {
+    status_message = "Try again as the root user";
+  }
+
+  return status_message;
+}
+
 Status Target::Attach(ProcessAttachInfo &attach_info, Stream *stream) {
   auto state = eStateInvalid;
   auto process_sp = GetProcessSP();
@@ -3188,9 +3228,14 @@ Status Target::Attach(ProcessAttachInfo &attach_info, Stream *stream) {
 
       if (state != eStateStopped) {
         const char *exit_desc = process_sp->GetExitDescription();
-        if (exit_desc)
-          error.SetErrorStringWithFormat("%s", exit_desc);
-        else
+        const char *ptrace_reason = "";
+        if (exit_desc) {
+          // If we are on a linux flavoured system
+          if (platform_sp->GetSystemArchitecture().GetTriple().isOSLinux()) {
+            ptrace_reason = fetchPtracePolicyIfApplicable(platform_sp);
+          }
+          error.SetErrorStringWithFormat("%s\n%s", exit_desc, ptrace_reason);
+        } else
           error.SetErrorString(
               "process did not stop (no such process or permission problem?)");
         process_sp->Destroy(false);
